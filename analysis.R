@@ -4,158 +4,127 @@ library(brms)
 library(plyr)
 library(dplyr)
 library(tidyr)
-library(cowplot)
-library(ggisoband)
+library(stringr)
+library(grid)
+library(tidybayes)
+library(bayestestR)
+library(modelr)
+library(emmeans)
+library(wesanderson)
+library(patchwork)
 
-args <- commandArgs(trailingOnly=T)
-if (length(args) != 1) {
-    writeLines('Usage: ./analisis.r <file-name>')
-    quit()
-}
-
-judgments <- read.csv(args[1], header=TRUE)
+## Read and normalize data
+judgments <- read.csv('data/processed_data_1_5_2020.csv', header=TRUE)
 judgments$MC_conf <- judgments$MC_conf / 100
 judgments$VAS_resp <- judgments$VAS_resp / 100
 judgments$VAS_conf <- judgments$VAS_conf / 100
-judgments$MC_resp <- factor(judgments$MC_resp, #ordered=TRUE,
-                            levels=c('did not cause', 'partially caused', 'totally caused'))
-length(unique(judgments$id))
-time <- aggregate(duration ~ id, judgments, function(x) mean(x) / 60.0)
-mean(time$duration)
-sd(time$duration) / sqrt(nrow(time))
+judgments <- judgments %>%
+    mutate(MC_resp=factor(MC_resp, levels=c('partially caused',
+                                            'did not cause',
+                                            'totally caused')))
 
-marginal_density <- function(judgments, var, group='MC_resp') {
-    ggplot(judgments) +
-        aes_string(x=var, color=group, fill=group) +
-        geom_density(bw=0.01, alpha=0.33) +
-        theme_classic() +
-        theme_void() + theme(legend.position='none')
-}
+## load custom plotting options/functions
+source('plot.R')
+
+### Print out descriptives
+writeLines(sprintf('# of participants: %d', length(unique(judgments$id))))
+subjData <- judgments %>% group_by(id) %>%
+    summarize(duration=duration[1]/60,
+              sex=sex[1], age=age[1])
+writeLines(sprintf('Duration: %2.2f (%2.2f)',
+                   mean(subjData$duration), sd(subjData$duration)))
+writeLines(sprintf('Age: %2.2f (%2.2f)', mean(subjData$age), sd(subjData$age)))
+subjData %>% select(sex) %>% table
 
 
-density_2d <- function(center, top, right) {
-    ## align marginal plots
-    aligned_x <- align_plots(top, center, align='v', axis='lr')[[1]]
-    aligned_y <- align_plots(right, center, align='h', axis='tb')[[1]]
-    
-    ## Arrange plots
-    plot_grid(aligned_x, NULL, center, aligned_y,
-              ncol = 2, nrow = 2,
-              rel_heights = c(0.25, 1),
-              rel_widths = c(1, 0.25))
-}
-
-pdf('hist2d.pdf')
-density_2d(ggplot(judgments) +
-           aes(x=VAS_resp, y=MC_conf, group=MC_resp, color=MC_resp, fill=MC_resp) +
-           geom_density_bands(aes(alpha=stat(ndensity)), ##h=c(0.25, 0.25),
-                              show.legend=FALSE) +
-           ##geom_point() +
-           xlab('Causal Rating') + ylab('Confidence') +
-           labs(color='Categorical Rating', fill='Categorical Rating') +
-           scale_alpha_continuous(range = c(0, 1)) +
-           theme_classic() +
-           theme(legend.position='bottom'),
-           marginal_density(judgments, 'VAS_resp'),
-           marginal_density(judgments, 'MC_conf') + coord_flip())
-density_2d(ggplot(judgments) +
-           aes(x=VAS_resp, y=MC_conf, group=MC_resp, fill=MC_resp) +
-           stat_density2d(aes(alpha=stat(ndensity)),
-                          geom='tile', contour=FALSE, show.legend=FALSE) +
-           xlab('Causal Rating') + ylab('Confidence') +
-           labs(color='Categorical Rating', fill='Categorical Rating') +
-           scale_alpha_continuous(range = c(0, 1)) +
-           theme_classic() +
-           theme(legend.position='bottom'),
-           marginal_density(judgments, 'VAS_resp'),
-           marginal_density(judgments, 'MC_conf') + coord_flip())
-dev.off()
-
-## binned_pp_check(model, judgments)
-##
-##  Compute/display pp_checks for a model for different levels of confidence.
-##  Uses type='hist' to avoid problems with bandwidth
-##
-binned_pp_check <- function(model, judgments, binwidth=1.0) {
-    for (l in levels(judgments$MC_resp)) {
-        for (upper in seq(binwidth, 1.0, by=binwidth)) {
-            upper = upper
-            lower = upper - binwidth
-            
-            mask <- (judgments$MC_resp == l) &
-                (judgments$MC_conf >= lower) &
-                (judgments$MC_conf <= upper)
-            j <- judgments[mask, ]
-            
-            if (!is.null(nrow(j)) && nrow(j) > 1) {
-                print(pp_check(model, bw=0.005, newdata=j) + theme_bw() +
-                      ggtitle(sprintf("%s Ratings (%1.2f - %1.2f Confidence)",
-                                      as.character(l), lower, upper)))
-            }
-        }
-    }
-}
-
+## Fit heteroscedastic Gaussian model
 mNormal <- brm(bf(VAS_resp ~ MC_resp * MC_conf + (1 |i| id) +
                       (1 |v| vignette:structure:condition),
                   sigma ~ MC_resp * MC_conf + (1 |i| id) +
                       (1 |v| vignette:structure:condition)),
-               prior=c(set_prior('normal(0, 10.0)', class='b'),
-                       set_prior('normal(0, 10.0)', class='b', dpar='sigma')),
-               data=judgments, file='mNormal2', cores=4, inits="0")
+               prior=c(set_prior('normal(0, 1.0)'),
+                       set_prior('normal(0, 5.0)', dpar='sigma')),
+               save_all_pars=TRUE, data=judgments,
+               file='mNormal', cores=4, iter=5000, inits="0")
 summary(mNormal)
 
+## Gather posterior draws on the linear scale for contrasts
+ratings <- judgments %>% data_grid(MC_resp, MC_conf=c(0, 1)) %>%
+    add_fitted_draws(mNormal, re_formula=NA,
+                     dpar='sigma', scale='linear') %>%
+    ungroup %>%
+    ## HACK: tidybayes won't treat MC_conf as a factor even if we,
+    ##       cast it to a factor, so let's make a factor
+    ##       out of the string versions of the levels
+    mutate(MC_conf=factor(ifelse(MC_conf==0, 'zero', 'one'),
+                          levels=c('zero', 'one'))) %>%
+    group_by(MC_resp, MC_conf)
 
-conditions <- data.frame(MC_resp=rep(levels(judgments$MC_resp), each=100),
-                         MC_conf=rep((1:100)/100), 3)
+## Gather posterior draws and predictions for plotting
+samples <- judgments %>% data_grid(MC_resp, MC_conf=seq(0, 1, 0.01)) %>%
+    add_fitted_draws(mNormal, re_formula=NA, dpar='sigma') %>%
+    median_hdi() %>% ungroup()
 
-effects <- conditions %>%
-    cbind(fitted(mNormal, newdata=conditions, re_formula=NA)) %>%
-    rename(VAS_resp=Estimate)
+#########################################################################################
+## Descriptives:
+##
+## plot raw data
+fig2A <- dplot(judgments, legend=FALSE)
+fig2A
+ggsave('data.png', width=12.5, height=10)
 
-#samples <- mNormal %>% fitted(re_formula=NA, summary=FALSE) %>% t %>%
-#    cbind(select(judgments, c(MC_resp, MC_conf))) %>%
-#    pivot_longer(-c('MC_resp', 'MC_conf'),
-#                 names_to='sample', values_to='VAS_resp')
+figConfMarginal <- marginal_density(judgments, 'MC_conf')
+figRatingMarginal <- marginal_density(judgments, 'VAS_resp') +
+    coord_flip()
 
-samples <- mNormal %>% fitted() %>%
-    cbind(select(judgments, c(MC_resp, MC_conf))) %>%
-    rename(VAS_resp=Estimate)
+## plot model predictions
+##  (use predict.brmsfit because tidybayes
+##   doesn't like the random effects specification)
+predictions <- cbind(judgments, t(predict(mNormal, summary=FALSE))) %>%
+    pivot_longer(-colnames(judgments),
+                 names_to='draw',
+                 values_to='.prediction')
 
-density_2d(effects %>%
-           ggplot + aes(x=MC_conf, y=VAS_resp, group=MC_resp) +
-           ##geom_density_bands(aes(alpha=stat(ndensity)), h=c(0.2, 0.2),
-           ##                   bins=20, show.legend=FALSE) +
-           geom_line(aes(color=MC_resp), size=2) +
-           geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5, fill=MC_resp), alpha=0.3) +
-           coord_flip() +
-           xlab('Causal Rating') + ylab('Confidence') +
-           labs(color='Categorical Rating', fill='Categorical Rating') +
-           ##scale_alpha_continuous(range = c(0, 1)) +
-           theme_classic() +
-           theme(legend.position='bottom'),
-           marginal_density(samples, 'VAS_resp'),
-           marginal_density(samples, 'MC_conf') + coord_flip())
+fig2B <- predictions %>%
+    filter(draw %in% sample(min(draw):max(draw), 5000)) %>%
+    dplot(y='.prediction', ylab='Predicted Causal Rating', bw.x=0.15, legend=FALSE)
 
-density_2d(ggplot(samples) +
-           aes(x=VAS_resp, y=MC_conf, group=MC_resp, fill=MC_resp) +
-           stat_density2d(aes(alpha=stat(ndensity)),
-                          geom='tile', contour=FALSE, show.legend=FALSE) +
-           xlab('Causal Rating') + ylab('Confidence') +
-           labs(color='Categorical Rating', fill='Categorical Rating') +
-           scale_alpha_continuous(range = c(0, 1)) +
-           theme_classic() +
-           theme(legend.position='bottom'),
-           marginal_density(samples, 'VAS_resp'),
-           marginal_density(samples, 'MC_conf') + coord_flip())
+figPredictionsMarginal <- marginal_density(predictions, '.prediction') +
+    coord_flip()
 
-##pdf("Normal2.pdf")
-##plot(mNormal)
-##pp_check(mNormal, bw=0.005) + theme_bw()
-##binned_pp_check(mNormal, judgments, binwidth=0.5)
-##marginal_effects(mNormal)
-##dev.off()
+fig2C <- mplot(samples, ylab='Mean Causal Rating')
+fig2D <- mplot(samples, y='sigma', ylab='σ(Causal Rating)')
 
+
+figConfMarginal + plot_spacer() + figConfMarginal + plot_spacer() +
+    fig2A + figRatingMarginal + fig2B + figPredictionsMarginal +
+        fig2C + plot_spacer() + fig2D + plot_spacer() +
+        plot_layout(nrow=3, heights=c(0.3, 1, 1),
+                    ncol=4, widths=c(1, 0.3, 1, 0.3),
+                    guides='collect') +
+        plot_annotation(tag_levels='A') &
+        theme(plot.tag=element_text(size=20),
+              plot.tag.position=c(0, 1.05)) + theme(legend.position='bottom')
+
+ggsave('Figure2.png', width=12.5, height=11)
+
+
+for (c in 1:100) {
+    predictions %>%
+        filter(MC_conf <= c/100) %>%
+        marginal_density('.prediction', void=FALSE, legend='bottom') +
+        ggtitle('Causal Rating')
+    ggsave(sprintf('plots/hist-%03d.png', c), width=10, height=5)
+}
+
+
+##    Perform model testing on alternate models
+##
+mReduced <- brm(bf(VAS_resp ~ MC_resp * MC_conf + (1 |i| id) +
+                       (1 |v| vignette:structure:condition)),
+                prior=c(set_prior('normal(0, 1.0)')),
+                save_all_pars=TRUE, data=judgments,
+                file='mReduced', cores=4, iter=5000, inits="0")
 
 mZOIB <- brm(bf(VAS_resp ~ MC_resp * MC_conf + (1 |i| id) +
                     (1 |v| vignette:structure:condition),
@@ -165,63 +134,321 @@ mZOIB <- brm(bf(VAS_resp ~ MC_resp * MC_conf + (1 |i| id) +
                     (1 |v| vignette:structure:condition),
                 coi ~ MC_resp * MC_conf + (1 |i| id) +
                     (1 |v| vignette:structure:condition)),
-             family=zero_one_inflated_beta(), data=judgments, file='mZOIB2',
+             family=zero_one_inflated_beta(), data=judgments,
+             file='mZOIB', save_all_pars=TRUE, cores=4,
              prior=c(set_prior('normal(0, 10.0)', class='b'),
                      set_prior('normal(0, 10.0)', class='b', dpar='phi'),
                      set_prior('normal(0, 10.0)', class='b', dpar='zoi'),
                      set_prior('normal(0, 10.0)', class='b', dpar='coi')),
-             cores=4, iter=2500, inits="0", control=list(adapt_delta=0.95))
-summary(mZOIB)
-##pdf("ZOIB2.pdf")
-##plot(mZOIB)
-##pp_check(mZOIB, bw=0.005) + theme_bw()
-##binned_pp_check(mZOIB, judgments, binwidth=0.5)
-##marginal_effects(mZOIB, probs=c(0.05, 0.95), points=TRUE)
-##dev.off()
+             iter=5000, inits="0", control=list(adapt_delta=0.99))
 
-##loo(mNormal, mZOIB)
+mGAM <- brm(VAS_resp ~ s(MC_conf, by=MC_resp) + MC_resp + (1 |i| id) +
+                (1 |v| vignette:structure:condition),
+            save_all_pars=TRUE, data=judgments, file='mGAM',
+            iter=5000, cores=4, control=list(adapt_delta=0.999,
+                                             max_treedepth=25))
 
-effects <- conditions %>%
-    cbind(fitted(mZOIB, re_formula=NA, newdata=conditions)) %>%
-    rename(VAS_resp=Estimate)
+LOO(mNormal, mReduced, mZOIB, mGAM)
+model_weights(mNormal, mReduced, mZOIB, mGAM)
 
-#samples <- mZOIB %>% fitted(re_formula=NA, summary=FALSE) %>% t %>%
-#    cbind(select(judgments, c(MC_resp, MC_conf))) %>%
-#    pivot_longer(-c('MC_resp', 'MC_conf'),
-#                 names_to='sample', values_to='VAS_resp')
 
-samples <- mZOIB %>% fitted() %>%
-    cbind(select(judgments, c(MC_resp, MC_conf))) %>%
-    rename(VAS_resp=Estimate)
 
-density_2d(effects %>%
-           ggplot + aes(x=MC_conf, y=VAS_resp, group=MC_resp) +
-           ##geom_density_bands(aes(alpha=stat(ndensity)), h=c(0.2, 0.2),
-           ##                   bins=20, show.legend=FALSE) +
-           geom_line(aes(color=MC_resp), size=2) +
-           geom_ribbon(aes(ymin=Q2.5, ymax=Q97.5, fill=MC_resp), alpha=0.3) +
-           coord_flip() +
-           xlab('Causal Rating') + ylab('Confidence') +
-           labs(color='Categorical Rating', fill='Categorical Rating') +
-           ##scale_alpha_continuous(range = c(0, 1)) +
-           theme_classic() +
-           theme(legend.position='bottom'),
-           marginal_density(samples, 'VAS_resp'),
-           marginal_density(samples, 'MC_conf') + coord_flip())
 
-density_2d(ggplot(samples) +
-           aes(x=VAS_resp, y=MC_conf, group=MC_resp, fill=MC_resp) +
-           stat_density2d(aes(alpha=stat(ndensity)),
-                          geom='tile', contour=FALSE, show.legend=FALSE) +
-           xlab('Causal Rating') + ylab('Confidence') +
-           labs(color='Categorical Rating', fill='Categorical Rating') +
-           scale_alpha_continuous(range = c(0, 1)) +
-           theme_classic() +
-           theme(legend.position='bottom'),
-           marginal_density(samples, 'VAS_resp'),
-           marginal_density(samples, 'MC_conf') + coord_flip())
 
-quit()
 
-kfold(mNormal, mZOIB, save_fits=TRUE)
-model_weights(mNormal, mZOIB, weights='loo')
+
+
+
+#########################################################################################
+##
+## Mean Causal Judgment:
+## 
+##
+## Set ROPE width
+ROPE <- sd(judgments$VAS_resp) * 0.1
+
+## Perform contrasts
+ratings %>% compare_levels(.value, by=MC_resp, comparison='control') %>%
+    ungroup() %>%
+    mutate(MC_conf=paste0('(', MC_conf, ')')) %>%
+    pivot_wider(names_from=c(MC_resp, MC_conf),
+                names_sep=' ',
+                values_from=.value) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95,
+                       rope_range=c(-ROPE, ROPE)) %>%
+    select(-c(CI, ROPE_CI, ROPE_low, ROPE_high))
+ratings %>% compare_levels(.value, by=MC_resp, comparison='control') %>%
+    ungroup %>% mutate(MC_conf=ifelse(MC_conf == 'zero', 0, 1)) %>%
+    ggplot(aes(x=factor(MC_conf), y=.value, group=MC_resp,
+               fill=stat(ifelse(abs(y) < ROPE, '0', group)))) +
+    stat_eye(position=position_dodge(width=1), n=10000) +
+    facet_wrap(~ MC_resp) +
+    geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
+    scale_fill_manual(values=c('gray80', PALETTE[-1])) +
+    ylab('Mean Causal Rating Contrasts: Discrete Rating') +
+    xlab('Confidence') +
+    theme_classic() + theme(legend.position='none')
+ggsave('contrast-discrete.png', width=6, height=4)
+
+ratings %>% compare_levels(.value, by=MC_conf) %>%
+    ungroup() %>%
+    mutate(MC_conf=paste0('(', MC_conf, ')')) %>%
+    pivot_wider(names_from=c(MC_resp, MC_conf),
+                names_sep=' ',
+                values_from=.value) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95,
+                       rope_range=c(-ROPE, ROPE)) %>%
+    select(-c(CI, ROPE_CI, ROPE_low, ROPE_high))
+ratings %>% compare_levels(.value, by=MC_conf) %>%
+    ggplot(aes(x=MC_resp, y=.value,
+               fill=stat(ifelse(abs(y) < ROPE, '0', group)))) +
+    stat_eye(position=position_dodge(width=1), n=10000) +
+    geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
+    scale_fill_manual(values=c('gray80', PALETTE)) +
+    ylab('Mean Causal Rating Contrasts: Confidence') +
+    xlab('Discrete Rating') +
+    theme_classic() + theme(legend.position='none')
+ggsave('contrast-confidence.png', width=6, height=4)
+
+ratings %>%
+    compare_levels(.value, by=MC_conf) %>%
+    compare_levels(.value, by=MC_resp, comparison='control') %>%
+    ungroup() %>%
+    mutate(MC_conf=paste0('(', MC_conf, ')')) %>%
+    pivot_wider(names_from=c(MC_resp, MC_conf),
+                names_sep=' ',
+                values_from=.value) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95,
+                       rope_range=c(-ROPE, ROPE)) %>%
+    select(-c(CI, ROPE_CI, ROPE_low, ROPE_high))
+ratings %>%
+    compare_levels(.value, by=MC_conf) %>%
+    compare_levels(.value, by=MC_resp, comparison='control') %>%
+    ggplot(aes(x=MC_resp, y=.value,
+               fill=stat(ifelse(abs(y) < ROPE, '0', group)))) +
+    stat_eye(position=position_dodge(width=1), n=10000) +
+    geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
+    scale_fill_manual(values=c('gray80', PALETTE[-1])) +
+    ylab('Mean Causal Rating Contrasts: Confidence x Discrete Rating') +
+    xlab('Discrete Rating') +
+    theme_classic() + theme(legend.position='none')
+ggsave('contrast-discreteXconfidence.png', width=6, height=4)
+
+
+#########################################################################################
+##
+## Standard Deviation of Causal Judgments:
+## 
+##
+## Set ROPE width
+sdROPE <- sd(fitted(mNormal, dpar='sigma', scale='linear', summary=FALSE)) * 0.1
+
+## Contrasts for sd(causal rating)
+ratings %>%
+    compare_levels(sigma, by=MC_resp, comparison='control') %>%
+    ungroup() %>%
+    mutate(MC_conf=paste0('(', MC_conf, ')')) %>%
+    pivot_wider(names_from=c(MC_resp, MC_conf),
+                names_sep=' ',
+                values_from=sigma) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95,
+                       rope_range=c(-sdROPE, sdROPE)) %>%
+    select(-c(CI, ROPE_CI, ROPE_low, ROPE_high))
+ratings %>%
+    compare_levels(sigma, by=MC_resp, comparison='control') %>%
+    ungroup %>% mutate(MC_conf=ifelse(MC_conf=='zero', 0, 1)) %>%
+    ggplot(aes(x=factor(MC_conf), y=sigma, group=MC_resp,
+               fill=stat(ifelse(abs(y) < ROPE, '0', group)))) +
+    stat_eye(position=position_dodge(width=1), n=10000) +
+    facet_wrap(~ MC_resp) +
+    geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
+    scale_fill_manual(values=c('gray80', PALETTE[-1])) +
+    ylab('σ(Causal Rating) Contrasts: Discrete Rating') +
+    xlab('Confidence') +
+    theme_classic() + theme(legend.position='none')
+ggsave('contrast-discrete-sd.png', width=6, height=4)
+
+ratings %>%
+    compare_levels(sigma, by=MC_conf) %>%
+    ungroup() %>%
+    mutate(MC_conf=paste0('(', MC_conf, ')')) %>%
+    pivot_wider(names_from=c(MC_resp, MC_conf),
+                names_sep=' ',
+                values_from=sigma) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95,
+                       rope_range=c(-sdROPE, sdROPE)) %>%
+    select(-c(CI, ROPE_CI, ROPE_low, ROPE_high))
+ratings %>%
+    compare_levels(sigma, by=MC_conf) %>%
+    ggplot(aes(x=MC_resp, y=sigma,
+               fill=stat(ifelse(abs(y) < ROPE, '0', group)))) +
+    stat_eye(position=position_dodge(width=1), n=10000) +
+    geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
+    scale_fill_manual(values=c('gray80', PALETTE)) +
+    ylab('σ(Causal Rating) Contrasts: Confidence') +
+    xlab('Discrete Rating') +
+    theme_classic() + theme(legend.position='none')
+ggsave('contrast-confidence-sd.png', width=6, height=4)
+
+ratings %>%
+    compare_levels(sigma, by=MC_conf) %>%
+    compare_levels(sigma, by=MC_resp, comparison='control') %>%
+    ungroup() %>%
+    mutate(MC_conf=paste0('(', MC_conf, ')')) %>%
+    pivot_wider(names_from=c(MC_resp, MC_conf),
+                names_sep=' ',
+                values_from=sigma) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95,
+                       rope_range=c(-sdROPE, sdROPE)) %>%
+    select(-c(CI, ROPE_CI, ROPE_low, ROPE_high))
+ratings %>%
+    compare_levels(sigma, by=MC_conf) %>%
+    compare_levels(sigma, by=MC_resp, comparison='control') %>%
+    ggplot(aes(x=MC_resp, y=sigma,
+               fill=stat(ifelse(abs(y) < ROPE, '0', group)))) +
+    stat_eye(position=position_dodge(width=1), n=10000) +
+    geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
+    scale_fill_manual(values=c('gray80', PALETTE[-1])) +
+    ylab('σ(Causal Rating) Contrasts: Confidence x Discrete Rating') +
+    xlab('Discrete Rating') +
+    theme_classic() + theme(legend.position='none')
+ggsave('contrast-discreteXconfidence-sd.png', width=6, height=4)
+
+
+
+
+## Plot model coefficient posteriors
+mNormal %>% gather_draws(b_Intercept, b_MC_respdidnotcause,
+                         b_MC_resptotallycaused,
+                         b_MC_conf, `b_MC_respdidnotcause:MC_conf`,
+                         `b_MC_resptotallycaused:MC_conf`) %>%
+    ungroup() %>%
+    mutate(.variable=
+               factor(str_replace_all(.variable,
+                                      c('b_'='', ':'=' : ',
+                                        'MC_respdidnotcause'=
+                                            'Discrete Rating [did not cause - partially caused]',
+                                        'MC_resptotallycaused'=
+                                            'Discrete Rating [totally caused - partially caused]',
+                                        'MC_conf'='Confidence')),
+                      levels=c('Discrete Rating [totally caused - partially caused] : Confidence',
+                               'Discrete Rating [did not cause - partially caused] : Confidence',
+                               'Confidence',
+                               'Discrete Rating [totally caused - partially caused]',
+                               'Discrete Rating [did not cause - partially caused]',
+                               'Intercept'))) %>%
+    ggplot(aes(y=.variable, x=.value,
+               fill=stat(abs(x) > ROPE))) +
+    xlab('Estimate') + ylab('') + stat_halfeyeh() +
+    geom_vline(xintercept=c(-ROPE, ROPE), linetype='dashed') +
+    scale_fill_manual(values=c('gray80', wes_palette("Darjeeling1", n=5)[5])) +
+    theme_classic() + theme(legend.position='none') +
+    plot_annotation(title='Coefficient Estimates for Experiment 1:',
+                            subtitle='Mean Causal Judgment')
+ggsave('coefficients_mu.png', width=8, height=6)
+
+mNormal %>% gather_draws(b_sigma_Intercept, b_sigma_MC_respdidnotcause,
+                         b_sigma_MC_resptotallycaused,
+                         b_sigma_MC_conf, `b_sigma_MC_respdidnotcause:MC_conf`,
+                         `b_sigma_MC_resptotallycaused:MC_conf`) %>%
+    ungroup() %>%
+    mutate(.variable=
+               factor(str_replace_all(.variable,
+                                      c('b_'='', ':'=' : ', 'sigma_'='',
+                                        'MC_respdidnotcause'=
+                                            'Discrete Rating [did not cause - partially caused]',
+                                        'MC_resptotallycaused'=
+                                            'Discrete Rating [totally caused - partially caused]',
+                                        'MC_conf'='Confidence')),
+                      levels=c('Discrete Rating [totally caused - partially caused] : Confidence',
+                               'Discrete Rating [did not cause - partially caused] : Confidence',
+                               'Confidence',
+                               'Discrete Rating [totally caused - partially caused]',
+                               'Discrete Rating [did not cause - partially caused]',
+                               'Intercept'))) %>%
+    ggplot(aes(y=.variable, x=.value,
+               fill=stat(abs(x) > sdROPE))) +
+    xlab('Estimate') + ylab('') + stat_halfeyeh() +
+    geom_vline(xintercept=c(-sdROPE, sdROPE), linetype='dashed') +
+    scale_fill_manual(values=c('gray80', wes_palette("Darjeeling1", n=5)[5])) +
+    theme_classic() + theme(legend.position='none') +
+    plot_annotation(title='Coefficient Estimates for Experiment 1:',
+                            subtitle='Standard Deviation of Causal Judgment')
+ggsave('coefficients_sigma.png', width=8, height=6)
+
+
+group_effects <- mNormal %>% gather_draws(sd_id__Intercept, sd_id__sigma_Intercept,
+                         `sd_vignette:structure:condition__Intercept`,
+                         `sd_vignette:structure:condition__sigma_Intercept`,
+                         cor_id__Intercept__sigma_Intercept,
+                         `cor_vignette:structure:condition__Intercept__sigma_Intercept`) %>%
+    ungroup() %>%
+    mutate(group=ifelse(str_detect(.variable, 'id'), 'Participant', 'Vignette'),
+           .variable=
+               factor(str_replace_all(.variable,
+                                      c('sd_id__Intercept'='σ(Intercept)',
+                                        'sd_id__sigma_Intercept'='σ(Intercept_σ)',
+                                        'sd_vignette:structure:condition__Intercept'=
+                                            'σ(Intercept)',
+                                        'sd_vignette:structure:condition__sigma_Intercept'=
+                                            'σ(Intercept_σ)',
+                                        'cor_id__Intercept__sigma_Intercept'=
+                                            'correlation(Intercept, Intercept_σ)',
+                                        'cor_vignette:structure:condition__Intercept__sigma_Intercept'=
+                                            'correlation(Intercept, Intercept_σ)')),
+                      levels=c('correlation(Intercept, Intercept_σ)',
+                               'σ(Intercept_σ)', 'σ(Intercept)')))
+
+group_effects %>%
+    ggplot(aes(y=.variable, x=.value)) +
+    xlab('Estimate') + ylab('') +
+    stat_halfeyeh(normalize='xy', fill=wes_palette("Darjeeling1", n=5)[5]) +
+    facet_grid(group ~ .) +
+    theme_classic() + theme(legend.position='none')
+
+
+ge1 <- group_effects %>%
+    filter(!str_detect(.variable, 'correlation')) %>%
+    ggplot(aes(y=.variable, x=.value)) +
+    xlab('Estimate') + ylab('') + coord_cartesian(xlim=c(0, 0.6)) +
+    stat_halfeyeh(normalize='xy', fill=wes_palette("Darjeeling1", n=5)[5]) +
+    facet_grid(group ~ .) +
+    theme_classic() + theme(legend.position='none')
+
+ge2 <- group_effects %>%
+    filter(str_detect(.variable, 'correlation')) %>%
+    ggplot(aes(y=.variable, x=.value)) +
+    xlab('Estimate') + ylab('') +
+    stat_halfeyeh(fill=wes_palette("Darjeeling1", n=5)[5]) +
+    facet_grid(group ~ .) +
+    theme_classic() + theme(legend.position='none')
+
+ge1 / ge2 + plot_annotation(title='Coefficient Estimates for Experiment 1:',
+                            subtitle='Group-Level Effects',
+                            tag_levels = 'A')
+ggsave('coefficients_re.png', width=8, height=6)
+
+group_effects %>%
+    filter(!str_detect(.variable, 'correlation')) %>%
+    pivot_wider(names_from=c(.variable, group), values_from=.value) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(., ci=0.95, test=c()) %>%
+    select(-c(CI))
+
+group_effects %>%
+    filter(str_detect(.variable, 'correlation')) %>%
+    pivot_wider(names_from=c(.variable, group), values_from=.value) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(., ci=0.95, rope_ci=0.95,
+                       rope_range=c(-sd(unlist(.))*0.1, sd(unlist(.))*0.1)) %>%
+    select(-c(CI, ROPE_CI))
+
+
+
+

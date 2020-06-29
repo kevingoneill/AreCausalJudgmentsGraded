@@ -38,4 +38,11 @@ df <- df %>% unite(temp, scale, measure) %>% spread(temp, response)
 df <- df[, c('id', 'age', 'sex', 'duration', 'vignette', 'structure', 'condition',
              'MC_resp', 'MC_conf', 'VAS_resp', 'VAS_conf')]
 
+## Currently, both 'abnormal' and 'action' conditions are coded as 'A'.
+## The following lines code them as 'Ab' and 'Ac', respectively
+df$condition[df$condition=='A' &
+             (df$vignette == 'I' | df$vignette == 'Cof' |
+              df$vignette == 'W')] <- 'Ac'
+df$condition[df$condition=='A'] <- 'Ab'
+
 write.csv(df, out_file, row.names=FALSE)

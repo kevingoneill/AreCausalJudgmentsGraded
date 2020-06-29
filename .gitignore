@@ -2,3 +2,6 @@
 *.png
 *.*~
 *.rds
+*.gif
+*.mp4
+*.Rhistory
