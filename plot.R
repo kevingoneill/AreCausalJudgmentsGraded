@@ -13,8 +13,8 @@ theme_GC <- function(palette=PALETTE) {
     list(theme_classic() +
          theme(axis.title.x=element_text(size=20, margin=margin(t=10)),
                axis.title.y=element_text(size=20, margin=margin(r=10)),
-               axis.text.x=element_text(size=10, margin=margin(t=5)),
-               axis.text.y=element_text(size=10, margin=margin(r=5)),
+               axis.text.x=element_text(size=16, margin=margin(t=5)),
+               axis.text.y=element_text(size=16, margin=margin(r=5)),
                legend.text=element_text(size=15),
                legend.title=element_text(size=20)),
          scale_alpha_continuous(range = c(0, 1)),
@@ -73,8 +73,8 @@ density_2d <- function(center, top, right) {
 
 dplot <- function(j, palette=PALETTE, y='VAS_resp', ylab='Causal Rating',
                   bw.x=NULL, bw.y=NULL, legend=TRUE) {
-    j <- j %>%
-        mutate(!!y := pmax(0.0, pmin(1.0, pull(., y)))) %>%
+    j <- j %>% ungroup %>%
+        mutate(!!y := pmax(0.0, pmin(1.0, pull(., !!y)))) %>%
         ggplot(aes(x=MC_conf, group=MC_resp, color=MC_resp, fill=MC_resp)) +
         aes_string(y=y) +
         geom_density_bands(aes(alpha=stat(ndensity)), h=c(bw.x, bw.y),
