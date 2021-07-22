@@ -10,7 +10,7 @@ PALETTE <- c(wes_palette("Darjeeling1", n=2)[2],
 
 ## A custom ggplot theme
 theme_GC <- function(palette=PALETTE) {
-    list(theme_classic() +
+    list(theme_classic(),
          theme(axis.title.x=element_text(size=20, margin=margin(t=10)),
                axis.title.y=element_text(size=20, margin=margin(r=10)),
                axis.text.x=element_text(size=16, margin=margin(t=5)),
@@ -18,10 +18,8 @@ theme_GC <- function(palette=PALETTE) {
                legend.text=element_text(size=15),
                legend.title=element_text(size=20)),
          scale_alpha_continuous(range = c(0, 1)),
-         scale_fill_manual(values=PALETTE,
-                           name='Discrete Causal Rating'),
-         scale_color_manual(values=PALETTE,
-                            name='Discrete Causal Rating'))
+         scale_fill_manual(values=palette, name='Discrete Causal Judgment'),
+         scale_color_manual(values=palette, name='Discrete Causal Judgment'))
 }
 
 ## A function to plot the marginal density of judgments$var,
@@ -71,7 +69,7 @@ density_2d <- function(center, top, right) {
     return(p)
 }
 
-dplot <- function(j, palette=PALETTE, y='VAS_resp', ylab='Causal Rating',
+dplot <- function(j, palette=PALETTE, y='VAS_resp', ylab='Causal Judgment',
                   bw.x=NULL, bw.y=NULL, legend=TRUE) {
     j <- j %>% ungroup %>%
         mutate(!!y := pmax(0.0, pmin(1.0, pull(., !!y)))) %>%
@@ -81,14 +79,13 @@ dplot <- function(j, palette=PALETTE, y='VAS_resp', ylab='Causal Rating',
                            bins=9, show.legend=c(alpha=FALSE,
                                                  fill=legend)) +
         coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
-        xlab('Confidence') + ylab(ylab) +
-        theme_GC()
+        xlab('Confidence') + ylab(ylab) + theme_GC(palette)
 }
 
 mplot <- function(samples, min=0.0, max=1.0,
                   palette=PALETTE,
                   y='.value', ymin=paste0(y, '.lower'),
-                  ymax=paste0(y, '.upper'), ylab='Causal Rating') {
+                  ymax=paste0(y, '.upper'), ylab='Causal Judgment') {
     samples %>%
         filter(MC_conf >= min & MC_conf <= max) %>%
         ggplot() +
@@ -96,7 +93,6 @@ mplot <- function(samples, min=0.0, max=1.0,
         aes_string(y=y, ymin=ymin, ymax=ymax) +
         geom_line(size=2) + geom_ribbon(alpha=0.3) +
         coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
-        xlab('Confidence') + ylab(ylab) +
-        theme_GC()
+        xlab('Confidence') + ylab(ylab) + theme_GC(palette)
 }
 

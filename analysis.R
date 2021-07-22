@@ -35,6 +35,13 @@ writeLines(sprintf('Duration: %2.2f (%2.2f)',
 writeLines(sprintf('Age: %2.2f (%2.2f)', mean(subjData$age), sd(subjData$age)))
 subjData %>% select(sex) %>% table
 
+writeLines(sprintf('Number of low-confidence discrete judgments: %d (%f percent)',
+                   sum(judgments$MC_conf < 0.5),
+                   sum(judgments$MC_conf < 0.5) / nrow(judgments) * 100))
+writeLines(sprintf('Number of low-confidence continuous judgments: %d (%f percent)',
+                   sum(judgments$VAS_conf < 0.5),
+                   sum(judgments$VAS_conf < 0.5) / nrow(judgments) * 100))
+
 
 ## Fit heteroscedastic Gaussian model
 mNormal <- brm(bf(VAS_resp ~ MC_resp * MC_conf + (1 |i| id) +
@@ -43,15 +50,15 @@ mNormal <- brm(bf(VAS_resp ~ MC_resp * MC_conf + (1 |i| id) +
                       (1 |v| vignette:structure:condition)),
                prior=c(set_prior('normal(0, 1.0)'),
                        set_prior('normal(0, 5.0)', dpar='sigma')),
-               save_all_pars=TRUE, data=judgments,
+               save_pars=save_pars(all=TRUE), data=judgments,
                file='mNormal', cores=4, iter=5000, inits="0")
+
 summary(mNormal)
 
 
 ## Gather posterior draws on the linear scale for contrasts
 em <- emmeans(mNormal, ~ MC_resp*MC_conf, at=list(MC_conf=0:1))
 em.sd <- emmeans(mNormal, ~ MC_resp*MC_conf, at=list(MC_conf=0:1), dpar='sigma')
-
 
 #########################################################################################
 ## Descriptives:
@@ -63,15 +70,13 @@ figRatingMarginal <- marginal_density(judgments, 'VAS_resp') + coord_flip()
 
 ## plot raw data
 fig2A <- dplot(judgments, legend=FALSE)
-fig2A
-ggsave('data.png', width=12.5, height=10)
 
 ## plot model predictions
 predictions <- add_predicted_draws(judgments, mNormal) %>% ungroup
 
 fig2B <- predictions %>%
     filter(.draw %in% sample(min(.draw):max(.draw), 50)) %>%
-    dplot(y='.prediction', ylab='Predicted Causal Rating', bw.x=0.15, legend=FALSE)
+    dplot(y='.prediction', ylab='Predicted Causal Judgment', bw.x=0.15, legend=FALSE)
 
 figPredictionsMarginal <- marginal_density(predictions, '.prediction') +
     coord_flip()
@@ -80,14 +85,14 @@ fig2C <- mNormal %>%
     emmeans(~ MC_resp*MC_conf, at=list(MC_conf=seq(0, 1, 0.01))) %>%
     as.data.frame %>%
     mplot(y='emmean', ymin='lower.HPD', ymax='upper.HPD',
-          ylab='Estimated Mean Causal Rating')
+          ylab='Estimated Mean Causal Judgment')
 
 fig2D <- mNormal %>%
     emmeans(~ MC_resp*MC_conf, at=list(MC_conf=seq(0, 1, 0.01)),
             dpar='sigma', type='response') %>%
     as.data.frame %>%
     mplot(y='response', ymin='lower.HPD', ymax='upper.HPD',
-          ylab='Estimated Standard Deviation\nof Causal Ratings')
+          ylab='Estimated Standard Deviation\nof Causal Judgments')
 
 
 figConfMarginal + plot_spacer() + figConfMarginal + plot_spacer() +
@@ -101,17 +106,61 @@ figConfMarginal + plot_spacer() + figConfMarginal + plot_spacer() +
               plot.tag.position=c(0.05, 1.1),
               legend.position='bottom')
 
-ggsave('Figure2.png', width=12.5, height=11)
+ggsave('Figure2_j.png', width=12.5, height=11)
 
 
-for (c in 1:100) {
-    predictions %>%
-        filter(MC_conf <= c/100) %>%
-        marginal_density('.prediction', void=FALSE, legend='bottom') +
-        ggtitle('Causal Rating')
-    ggsave(sprintf('plots/hist-%03d.png', c), width=10, height=5)
+
+(marginal_density(judgments, 'MC_conf')) + plot_spacer() +
+    (dplot(judgments, legend=FALSE) +
+     scale_x_continuous(name='Confidence Rating', labels=c('0', '.25', '.5', '.75', '1')) +
+     scale_y_continuous(labels=c('0', '.25', '.5', '.75', '1'))) +
+    (marginal_density(judgments, 'VAS_resp') + coord_flip()) +
+        plot_layout(nrow=2, ncol=2, heights=c(.3, 1), widths=c(1, .3))
+ggsave('data_marginals.png', height=5, width=5)
+
+plot_spacer() + plot_spacer() +
+    (fig2D +
+     theme(axis.text=element_text(size=12),
+           axis.title=element_text(size=24),
+           legend.position='none') +
+     scale_x_continuous(name='Confidence Rating', labels=c('0', '.25', '.5', '.75', '1')) +
+     scale_y_continuous(name='SD of Causal Ratings', labels=c('0', '.25', '.5', '.75', '1'))) +
+    plot_spacer() +
+    plot_layout(nrow=2, ncol=2, heights=c(.3, 1), widths=c(1, .3))
+ggsave('sd_marginals.png', height=5, width=5)
+
+
+for (i in list(3, 2:3, 1:3)) {
+    l <- levels(judgments$MC_resp)[i]
+    j <- filter(judgments, MC_resp %in% l)
+    pal <- PALETTE[i]
+    p <- (marginal_density(j, 'MC_conf', palette=pal)) + plot_spacer() +
+        (dplot(j, legend=FALSE, palette=pal) +
+         theme(axis.text=element_text(size=12),
+               axis.title=element_text(size=24),
+               legend.position='none') +
+         scale_x_continuous(name='Confidence Rating', labels=c('0', '.25', '.5', '.75', '1')) +
+         scale_y_continuous(name='Causal Rating', labels=c('0', '.25', '.5', '.75', '1'))) +
+        (marginal_density(j, 'VAS_resp', palette=pal) + coord_flip()) +
+        plot_layout(nrow=2, ncol=2, heights=c(.3, 1), widths=c(1, .3))
+    ggsave(paste0('data_marginals_', length(l), '.png'), p, height=5, width=5)
+
+    p <- (marginal_density(j, 'MC_conf', palette=pal)) + plot_spacer() +
+        (mNormal %>%
+         emmeans(~ MC_resp*MC_conf, at=list(MC_conf=seq(0, 1, 0.01))) %>%
+         as.data.frame %>%
+         filter(MC_resp %in% l) %>%
+         mplot(y='emmean', ymin='lower.HPD', ymax='upper.HPD',
+               ylab='Estimated Mean Causal Rating', palette=pal) +
+         theme(axis.text=element_text(size=12),
+               axis.title=element_text(size=24),
+               legend.position='none') +
+         scale_x_continuous(name='Confidence Rating', labels=c('0', '.25', '.5', '.75', '1')) +
+         scale_y_continuous(name='Predicted Causal Rating', labels=c('0', '.25', '.5', '.75', '1'))) +
+        (marginal_density(filter(predictions, MC_resp %in% l), '.prediction', palette=pal) + coord_flip()) +
+        plot_layout(nrow=2, ncol=2, heights=c(.3, 1), widths=c(1, .3))
+    ggsave(paste0('predictions_marginals_', length(l), '.png'), p, height=5, width=5)
 }
-
 
 
 
@@ -167,7 +216,8 @@ ROPE <- sd(judgments$VAS_resp) * 0.1
 ## Perform contrasts
 c1.mean <- em %>% contrast('trt.vs.ctrl', simple='MC_resp') %>%
     describe_posterior(ci=0.95, rope_ci=.95, rope_range=c(-ROPE, ROPE)) %>%
-    mutate(Parameter=paste0('Mean, ', Parameter))
+    mutate(Parameter=paste0('Mean, ', Parameter),
+           P=pd_to_p(pd))
 c1.mean
 
 em %>% contrast('trt.vs.ctrl', simple='MC_resp') %>% gather_emmeans_draws %>%
@@ -180,13 +230,14 @@ em %>% contrast('trt.vs.ctrl', simple='MC_resp') %>% gather_emmeans_draws %>%
     geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
     scale_fill_manual(values=c('gray80', PALETTE[-1])) +
     scale_x_discrete(labels=c('DNC - PC', 'TC - PC'), name='Contrast') +
-    ylab('Mean Causal Rating Contrasts: Discrete Rating') +
+    ylab('Mean Causal Rating Contrasts:\nDiscrete Causal Judgmnet') +
     theme_classic() + theme(legend.position='none')
 ggsave('contrast-discrete.png', width=6, height=4)
 
 c2.mean <- em %>% contrast('trt.vs.ctrl', simple='MC_conf') %>%
     describe_posterior(ci=0.95, rope_ci=0.95, rope_range=c(-ROPE, ROPE)) %>%
-    mutate(Parameter=paste0('Mean, ', Parameter))
+    mutate(Parameter=paste0('Mean, ', Parameter),
+           P=pd_to_p(pd))
 c2.mean
 
 em %>% contrast('trt.vs.ctrl', simple='MC_conf') %>% gather_emmeans_draws %>%
@@ -195,14 +246,15 @@ em %>% contrast('trt.vs.ctrl', simple='MC_conf') %>% gather_emmeans_draws %>%
     stat_eye(position=position_dodge(width=1), n=10000) +
     geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
     scale_fill_manual(values=c('gray80', PALETTE)) +
-    ylab('Mean Causal Rating Contrasts: Confidence') +
-    xlab('Discrete Rating') +
+    ylab('Mean Causal Judgment Contrasts: Confidence') +
+    xlab('Discrete Causal Judgment') +
     theme_classic() + theme(legend.position='none')
 ggsave('contrast-confidence.png', width=6, height=4)
 
 c3.mean <- em %>% contrast('trt.vs.ctrl', interaction=TRUE) %>%
     describe_posterior(ci=0.95, rope_ci=0.95, rope_range=c(-ROPE, ROPE)) %>%
-    mutate(Parameter=paste0('Mean, ', Parameter))
+    mutate(Parameter=paste0('Mean, ', Parameter),
+           P=pd_to_p(pd))
 c3.mean
 
 
@@ -215,10 +267,12 @@ em %>% contrast('trt.vs.ctrl', interaction=TRUE) %>% gather_emmeans_draws %>%
     stat_eye(position=position_dodge(width=1), n=10000) +
     geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
     scale_fill_manual(values=c('gray80', PALETTE[-1])) +
-    ylab('Mean Causal Rating Contrasts:\nConfidence x Discrete Rating') +
-    xlab('Discrete Rating') +
+    ylab('Mean Causal Rating Contrasts:\nConfidence x Discrete Causal Judgment') +
+    xlab('Discrete Causal Judgment') +
     theme_classic() + theme(legend.position='none')
 ggsave('contrast-discreteXconfidence.png', width=6, height=4)
+
+
 
 #########################################################################################
 ##
@@ -231,7 +285,8 @@ sdROPE <- sd(fitted(mNormal, dpar='sigma', scale='linear', summary=FALSE)) * 0.1
 ## Contrasts for sd(causal rating)
 c1.sd <- em.sd %>% contrast('trt.vs.ctrl', simple='MC_resp') %>%
     describe_posterior(ci=0.95, rope_ci=0.95, rope_range=c(-sdROPE, sdROPE)) %>%
-    mutate(Parameter=paste0('SD, ', Parameter))
+    mutate(Parameter=paste0('SD, ', Parameter),
+           P=pd_to_p(pd))
 c1.sd
 
 em.sd %>% contrast('trt.vs.ctrl', simple='MC_resp') %>%
@@ -243,7 +298,7 @@ em.sd %>% contrast('trt.vs.ctrl', simple='MC_resp') %>%
     geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
     scale_fill_manual(values=c('gray80', PALETTE[-1])) +
     scale_x_discrete(labels=c('DNC - PC', 'TC - PC'), name='Contrast') +
-    ylab('Standard Deviation of Causal Rating Contrasts:\nDiscrete Rating') +
+    ylab('Standard Deviation of Causal Judgment Contrasts:\nDiscrete Causal Judgment') +
     theme_classic() + theme(legend.position='none')
 ggsave('contrast-discrete-sd.png', width=6, height=4)
 
@@ -251,7 +306,8 @@ ggsave('contrast-discrete-sd.png', width=6, height=4)
 
 c2.sd <- em.sd %>% contrast('trt.vs.ctrl', simple='MC_conf') %>%
     describe_posterior(ci=0.95, rope_ci=0.95, rope_range=c(-sdROPE, sdROPE)) %>%
-    mutate(Parameter=paste0('SD, ', Parameter))
+    mutate(Parameter=paste0('SD, ', Parameter),
+           P=pd_to_p(pd))
 c2.sd
 
 em.sd %>% contrast('trt.vs.ctrl', simple='MC_conf') %>%
@@ -261,15 +317,16 @@ em.sd %>% contrast('trt.vs.ctrl', simple='MC_conf') %>%
     stat_eye(position=position_dodge(width=1), n=10000) +
     geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
     scale_fill_manual(values=c('gray80', PALETTE)) +
-    ylab('Standard Deviation of Causal Rating Contrasts\nConfidence') +
-    xlab('Discrete Rating') +
+    ylab('Standard Deviation of Causal Judgment Contrasts:\nConfidence') +
+    xlab('Discrete Causal Judgment') +
     theme_classic() + theme(legend.position='none')
 ggsave('contrast-confidence-sd.png', width=6, height=4)
 
 c3.sd <- em.sd %>% contrast('trt.vs.ctrl', interaction=TRUE) %>%
     describe_posterior(ci=0.95, rope_ci=0.95,
                        rope_range=c(-sdROPE, sdROPE)) %>%
-    mutate(Parameter=paste0('SD, ', Parameter))
+    mutate(Parameter=paste0('SD, ', Parameter),
+           P=pd_to_p(pd))
 c3.sd
 
 em.sd %>% contrast('trt.vs.ctrl', interaction=TRUE) %>%
@@ -281,13 +338,13 @@ em.sd %>% contrast('trt.vs.ctrl', interaction=TRUE) %>%
     stat_eye(position=position_dodge(width=1), n=10000) +
     geom_hline(yintercept=c(-ROPE, ROPE), linetype='dashed') +
     scale_fill_manual(values=c('gray80', PALETTE[-1])) +
-    ylab('Standard Deviation of Causal Rating Contrasts:\nConfidence x Discrete Rating') +
-    xlab('Discrete Rating') +
+    ylab('Standard Deviation of Causal Judgment Contrasts:\nConfidence x Discrete Causal Judgment') +
+    xlab('Discrete Causal Judgment') +
     theme_classic() + theme(legend.position='none')
 ggsave('contrast-discreteXconfidence-sd.png', width=6, height=4)
 
 
-
+## Export contrast stats
 rbind(c2.mean, c2.sd) %>%
     separate(Parameter, into=c('Parameter', 'Confidence', 'DiscreteRating'),
              sep=', ') %>%
@@ -306,7 +363,7 @@ rbind(c2.mean, c2.sd) %>%
            Confidence=factor(str_replace_all(Confidence, c('0'='Low', '1'='High')),
                              levels=c('Low', 'High', 'High - Low'))) %>%
     select(Parameter, DiscreteRating, Confidence,
-           Median, CI, pd, ROPE, ROPE_Percentage) %>%
+           Median, CI, pd, P, ROPE, ROPE_Percentage) %>%
     arrange(Parameter, Confidence, DiscreteRating) %>%
     write.csv('contrasts.csv', row.names=F)
 
@@ -323,15 +380,15 @@ mNormal %>% gather_draws(b_Intercept, b_MC_respdidnotcause,
                factor(str_replace_all(.variable,
                                       c('b_'='', ':'=' : ',
                                         'MC_respdidnotcause'=
-                                            'Discrete Rating [did not cause - partially caused]',
+                                            'Discrete Causal Judgment\n[did not cause - partially caused]',
                                         'MC_resptotallycaused'=
-                                            'Discrete Rating [totally caused - partially caused]',
+                                            'Discrete Causal Judgment\n[totally caused - partially caused]',
                                         'MC_conf'='Confidence')),
-                      levels=c('Discrete Rating [totally caused - partially caused] : Confidence',
-                               'Discrete Rating [did not cause - partially caused] : Confidence',
+                      levels=c('Discrete Causal Judgment\n[totally caused - partially caused] : Confidence',
+                               'Discrete Causal Judgment\n[did not cause - partially caused] : Confidence',
                                'Confidence',
-                               'Discrete Rating [totally caused - partially caused]',
-                               'Discrete Rating [did not cause - partially caused]',
+                               'Discrete Causal Judgment\n[totally caused - partially caused]',
+                               'Discrete Causal Judgment\n[did not cause - partially caused]',
                                'Intercept'))) %>%
     ggplot(aes(y=.variable, x=.value,
                fill=stat(abs(x) > ROPE))) +
@@ -340,7 +397,7 @@ mNormal %>% gather_draws(b_Intercept, b_MC_respdidnotcause,
     scale_fill_manual(values=c('gray80', wes_palette("Darjeeling1", n=5)[5])) +
     theme_classic() + theme(legend.position='none') +
     plot_annotation(title='Coefficient Estimates for Experiment 1:',
-                            subtitle='Mean Causal Judgment')
+                    subtitle='Mean Causal Judgment')
 ggsave('coefficients_mu.png', width=8, height=6)
 
 mNormal %>% gather_draws(b_sigma_Intercept, b_sigma_MC_respdidnotcause,
@@ -352,15 +409,15 @@ mNormal %>% gather_draws(b_sigma_Intercept, b_sigma_MC_respdidnotcause,
                factor(str_replace_all(.variable,
                                       c('b_'='', ':'=' : ', 'sigma_'='',
                                         'MC_respdidnotcause'=
-                                            'Discrete Rating [did not cause - partially caused]',
+                                            'Discrete Causal Judgment\n[did not cause - partially caused]',
                                         'MC_resptotallycaused'=
-                                            'Discrete Rating [totally caused - partially caused]',
+                                            'Discrete Causal Judgment\n[totally caused - partially caused]',
                                         'MC_conf'='Confidence')),
-                      levels=c('Discrete Rating [totally caused - partially caused] : Confidence',
-                               'Discrete Rating [did not cause - partially caused] : Confidence',
+                      levels=c('Discrete Causal Judgment\n[totally caused - partially caused] : Confidence',
+                               'Discrete Causal Judgment\n[did not cause - partially caused] : Confidence',
                                'Confidence',
-                               'Discrete Rating [totally caused - partially caused]',
-                               'Discrete Rating [did not cause - partially caused]',
+                               'Discrete Causal Judgment\n[totally caused - partially caused]',
+                               'Discrete Causal Judgment\n[did not cause - partially caused]',
                                'Intercept'))) %>%
     ggplot(aes(y=.variable, x=.value,
                fill=stat(abs(x) > sdROPE))) +
@@ -435,7 +492,8 @@ group_effects %>%
     pivot_wider(names_from=c(.variable, group), values_from=.value) %>%
     select(-.chain, -.iteration, -.draw) %>%
     describe_posterior(., ci=0.95, rope_ci=0.95,
-                       rope_range=c(-sd(unlist(.))*0.1, sd(unlist(.))*0.1))
+                       rope_range=c(-sd(unlist(.))*0.1, sd(unlist(.))*0.1)) %>%
+    mutate(P=pd_to_p(pd))
 
 
 
@@ -453,7 +511,192 @@ judgments %>%
                                               'S'='Sprinkler', 'T'='Train',
                                               'W'='Watch'))) +
     coord_cartesian(xlim=c(0,1), ylim=c(0,1), expand=FALSE) +
-    xlab('Confidence') + ylab('Mean Causal Rating') +
+    scale_x_continuous(labels=c('0', '.25', '5', '.75', '1')) +
+    scale_y_continuous(labels=c('0', '.25', '5', '.75', '1')) +
+    xlab('Confidence') + ylab('Mean Causal Causal Judgment') +
     theme_GC() + theme(panel.spacing=unit(1.5, "lines"),
                        legend.position='bottom')
 ggsave('data_vignette.png', width=10, height=10)
+
+
+judgments %>%
+    mutate(condition=factor(ifelse(condition=='N', 'Normal',
+                            ifelse(condition=='Ab', 'Abnormal',
+                            ifelse(condition=='Ac', 'Action', 'Inaction'))),
+                            levels=c('Normal', 'Abnormal', 'Inaction', 'Action')),
+           structure=ifelse(structure=='JC', 'Conjunctive', 'Disjunctive')) %>%
+    ggplot(aes(x=MC_conf, y=VAS_resp, color=MC_resp, fill=MC_resp)) +
+    geom_smooth(method='lm', size=2, fullrange=TRUE, alpha=0.2) +
+    facet_grid(structure ~ condition) +
+    coord_cartesian(xlim=c(0,1), ylim=c(0,1), expand=FALSE) +
+    scale_x_continuous(labels=c('0', '.25', '5', '.75', '1')) +
+    scale_y_continuous(labels=c('0', '.25', '5', '.75', '1')) +
+    xlab('Confidence') + ylab('Mean Causal Causal Judgment') +
+    theme_GC() + theme(panel.spacing=unit(1.5, "lines"),
+                       legend.position='bottom')
+ggsave('data_conditions.png', width=15, height=10)
+
+
+
+
+
+
+
+#########################################################################################
+##
+## Use model comparison to test our effects (Table S1.1)
+## 
+mNormal.add <- brm(bf(VAS_resp ~ MC_resp + MC_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition),
+                  sigma ~ MC_resp + MC_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition)),
+               prior=c(set_prior('normal(0, 1.0)'),
+                       set_prior('normal(0, 5.0)', dpar='sigma')),
+               save_pars=save_pars(all=TRUE), data=judgments,
+               file='mNormal2', cores=4, iter=5000, inits="0")
+
+mNormal.str <- brm(bf(VAS_resp ~ MC_resp + (1 |i| id) +
+                      (1 |v| vignette:structure:condition),
+                  sigma ~ MC_resp + (1 |i| id) +
+                      (1 |v| vignette:structure:condition)),
+               prior=c(set_prior('normal(0, 1.0)'),
+                       set_prior('normal(0, 5.0)', dpar='sigma')),
+               save_pars=save_pars(all=TRUE), data=judgments,
+               file='mNormal3', cores=4, iter=5000, inits="0")
+
+mNormal.conf <- brm(bf(VAS_resp ~ MC_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition),
+                  sigma ~ MC_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition)),
+               prior=c(set_prior('normal(0, 1.0)'),
+                       set_prior('normal(0, 5.0)', dpar='sigma')),
+               save_pars=save_pars(all=TRUE), data=judgments,
+               file='mNormal4', cores=4, iter=5000, inits="0")
+
+mNormal.null <- brm(bf(VAS_resp ~ 1 + (1 |i| id) +
+                           (1 |v| vignette:structure:condition),
+                       sigma ~ 1 + (1 |i| id) +
+                           (1 |v| vignette:structure:condition)),
+                    save_pars=save_pars(all=TRUE), data=judgments,
+                    file='mNormal5', cores=4, iter=5000, inits="0")
+
+loo(mNormal, mNormal.add, mNormal.str, mNormal.conf, mNormal.null, moment_match=TRUE)
+model_weights(mNormal, mNormal.add, mNormal.str, mNormal.conf, mNormal.null)
+
+
+
+
+#########################################################################################
+##
+## Replicate analyses with confidence in *continuous* causal judgment
+## 
+
+## Estimate correlation between MC_conf and VAS_conf
+mConf <- brm(mvbind(MC_conf, VAS_conf) ~ 1,
+             save_pars=save_pars(all=TRUE), data=judgments,
+             file='mConfCorr', cores=4, iter=5000)
+summary(mConf)
+
+mConf %>% spread_draws(rescor__MCconf__VASconf) %>%
+    pull(rescor__MCconf__VASconf) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95) %>%
+    mutate(P=pd_to_p(pd))
+
+ggplot(judgments, aes(x=MC_conf, y=VAS_conf, color=MC_resp)) +
+    geom_point() +
+    geom_smooth(method='lm')
+
+## replicate using VAS_conf instead of MC_conf
+mNormal.VAS <- brm(bf(VAS_resp ~ MC_resp * VAS_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition),
+                  sigma ~ MC_resp * VAS_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition)),
+               prior=c(set_prior('normal(0, 1.0)'),
+                       set_prior('normal(0, 5.0)', dpar='sigma')),
+               save_pars=save_pars(all=TRUE), data=judgments,
+               file='mNormalVAS', cores=4, iter=5000, inits="0")
+
+mNormal.VAS.add <- brm(bf(VAS_resp ~ MC_resp + VAS_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition),
+                  sigma ~ MC_resp + VAS_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition)),
+               prior=c(set_prior('normal(0, 1.0)'),
+                       set_prior('normal(0, 5.0)', dpar='sigma')),
+               save_pars=save_pars(all=TRUE), data=judgments,
+               file='mNormalVAS2', cores=4, iter=5000, inits="0")
+
+mNormal.VAS.conf <- brm(bf(VAS_resp ~ VAS_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition),
+                  sigma ~ VAS_conf + (1 |i| id) +
+                      (1 |v| vignette:structure:condition)),
+               prior=c(set_prior('normal(0, 1.0)'),
+                       set_prior('normal(0, 5.0)', dpar='sigma')),
+               save_pars=save_pars(all=TRUE), data=judgments,
+               file='mNormalVAS4', cores=4, iter=5000, inits="0")
+
+summary(mNormal.VAS)
+
+
+loo(mNormal.VAS, mNormal.VAS.add, mNormal.str, mNormal.VAS.conf, mNormal.null, moment_match=TRUE)
+model_weights(mNormal.VAS, mNormal.VAS.add, mNormal.str, mNormal.VAS.conf, mNormal.null)
+
+
+
+## Marginal effects of confidence
+emtrends(mNormal.VAS, ~MC_resp, var='VAS_conf')
+
+
+## Plot marginal means & model predictions
+figConfMarginal <- marginal_density(judgments, 'VAS_conf')
+figRatingMarginal <- marginal_density(judgments, 'VAS_resp') + coord_flip()
+
+## plot raw data
+fig2A <- dplot(judgments, legend=FALSE)
+fig2A
+
+## plot model predictions
+predictions <- add_predicted_draws(judgments, mNormal.VAS) %>% ungroup
+
+fig2B <- predictions %>%
+    ##filter(.draw %in% sample(min(.draw):max(.draw), 50)) %>%
+    dplot(y='.prediction', ylab='Predicted Causal Judgment', bw.x=0.15, legend=FALSE)
+
+figPredictionsMarginal <- marginal_density(predictions, '.prediction') +
+    coord_flip()
+
+
+fig2C <- mNormal.VAS %>%
+    emmeans(~ MC_resp*VAS_conf, at=list(VAS_conf=seq(0, 1, 0.01))) %>%
+    as.data.frame %>%
+    ggplot(aes(x=VAS_conf, y=emmean,
+               ymin=lower.HPD, ymax=upper.HPD,
+               color=MC_resp, fill=MC_resp)) +
+    geom_line(size=2) + geom_ribbon(alpha=0.3) +
+    coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+    xlab('Confidence') + ylab('Estimated Mean Causal Judgment') + theme_GC()
+
+
+fig2D <- mNormal.VAS %>%
+    emmeans(~ MC_resp*VAS_conf, at=list(VAS_conf=seq(0, 1, 0.01)),
+            dpar='sigma', type='response') %>%
+    as.data.frame %>%
+    ggplot(aes(x=VAS_conf, y=response,
+               ymin=lower.HPD, ymax=upper.HPD,
+               color=MC_resp, fill=MC_resp)) +
+    geom_line(size=2) + geom_ribbon(alpha=0.3) +
+    coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+    xlab('Confidence') + ylab('Estimated Standard Deviation\nof Causal Judgments') + theme_GC()
+
+
+
+figConfMarginal + plot_spacer() + figConfMarginal + plot_spacer() +
+    fig2A + figRatingMarginal + fig2B + figPredictionsMarginal +
+        fig2C + plot_spacer() + fig2D + plot_spacer() +
+        plot_layout(nrow=3, heights=c(0.3, 1, 1),
+                    ncol=4, widths=c(1, 0.3, 1, 0.3),
+                    guides='collect') +
+        plot_annotation(tag_levels=list(c('', '', 'A', '', 'B', '', 'C', 'D'))) &
+        theme(plot.tag=element_text(size=28),
+              plot.tag.position=c(0.05, 1.1),
+              legend.position='bottom')
+ggsave('FigureS1-11.png', width=12.5, height=11)
