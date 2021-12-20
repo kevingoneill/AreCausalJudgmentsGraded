@@ -13,14 +13,15 @@ library(wesanderson)
 library(patchwork)
 
 ## Read and normalize data
-judgments <- read.csv('data/processed_data.csv', header=TRUE)
-judgments$MC_conf <- judgments$MC_conf / 100
-judgments$VAS_resp <- judgments$VAS_resp / 100
-judgments$VAS_conf <- judgments$VAS_conf / 100
-judgments <- judgments %>%
-    mutate(MC_resp=factor(MC_resp, levels=c('partially caused',
+judgments <- read.csv('data/processed_data.csv', header=TRUE) %>%
+    mutate(MC_conf=MC_conf/100,
+           VAS_resp=VAS_resp/100,
+           VAS_conf=VAS_conf/100,
+           MC_resp=factor(MC_resp, levels=c('partially caused',
                                             'did not cause',
-                                            'totally caused')))
+                                            'totally caused')),
+           normality=factor(ifelse(condition %in% c('N', 'I'), 'normal', 'abnormal'),
+                            levels=c('normal', 'abnormal')))
 
 ## load custom plotting options/functions
 source('plot.R')
@@ -52,7 +53,6 @@ mNormal <- brm(bf(VAS_resp ~ MC_resp * MC_conf + (1 |i| id) +
                        set_prior('normal(0, 5.0)', dpar='sigma')),
                save_pars=save_pars(all=TRUE), data=judgments,
                file='mNormal', cores=4, iter=5000, inits="0")
-
 summary(mNormal)
 
 
@@ -700,3 +700,179 @@ figConfMarginal + plot_spacer() + figConfMarginal + plot_spacer() +
               plot.tag.position=c(0.05, 1.1),
               legend.position='bottom')
 ggsave('FigureS1-11.png', width=12.5, height=11)
+
+
+
+#########################################################################################
+##
+## Test for norm effects
+## 
+
+ROPE.MC_resp <- .05
+ROPE.MC_conf <- sd(judgments$MC_conf) * .1
+ROPE.VAS_conf <- sd(judgments$VAS_conf) * .1
+
+### Test for normality effect in continuous causal judgment / confidence
+mNorm_VAS <- brm(bf(VAS_resp ~ structure*normality + (1 |v| vignette),
+                    sigma ~ structure*normality + (1 |v| vignette)) +
+                 bf(VAS_conf ~ structure*normality + (1 |v| vignette),
+                    sigma ~ structure*normality + (1 |v| vignette)) +
+                 set_rescor(TRUE),
+                 prior=c(set_prior('normal(0, 1.0)', resp='VASresp'),
+                         set_prior('normal(0, 5.0)', resp='VASresp', dpar='sigma'),
+                         set_prior('normal(0, 1.0)', resp='VASconf'),
+                         set_prior('normal(0, 5.0)', resp='VASconf', dpar='sigma')),
+                 data=judgments, file='mNorm_VAS', iter=5000, backend='cmdstanr',
+                 control=list(adapt_delta=.95), cores=4, inits="0", sample_prior="yes", save_pars=save_pars(all=TRUE))
+summary(mNorm_VAS, priors=TRUE)
+
+draws_VAS <- judgments %>%
+    data_grid(structure, normality) %>%
+    add_epred_draws(mNorm_VAS, re_formula=NA, dpar='sigma')
+
+## contrast abnormal - normal
+draws_VAS %>% compare_levels(.epred, by='normality') %>%
+    pivot_wider(names_from=c(.category, structure), values_from=.epred) %>%
+    select(VASresp_JC, VASresp_OD) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95, rope_range=c(-ROPE, ROPE)) %>%
+    bind_rows(draws_VAS %>% compare_levels(.epred, by='normality') %>%
+              pivot_wider(names_from=c(.category, structure), values_from=.epred) %>%
+              select(VASconf_JC, VASconf_OD) %>%
+              describe_posterior(ci=0.95, rope_ci=0.95, rope_range=c(-ROPE.VAS_conf, ROPE.VAS_conf))) %>%
+    mutate(P=pd_to_p(pd))
+
+## plot results
+ggplot(draws_VAS, aes(x=structure, y=.epred, fill=normality)) +
+    stat_halfeye(aes(side=ifelse(normality=='normal', 'left', 'right')),
+                 point_interval=median_hdi, position=position_dodge(.25)) +
+    theme_classic(base_size=14) + theme(axis.title.x=element_blank()) +
+    facet_grid(.category~., scales='free_x',
+               labeller=labeller(.category=c('VASresp'='Causal Judgment', 'VASconf'='Confidence'))) +
+    ylim(0, 1) + ylab('Posterior Mean') +
+    scale_x_discrete(labels=c('Conjunctive', 'Disjunctive')) + 
+    scale_fill_manual(name='Normality', values=rev(wes_palette("Darjeeling1", n=2)),
+                      labels=c('Normal', 'Abnormal'))
+ggsave('FigureS1-13.png', width=7.5, height=5)
+
+
+
+
+
+### Test for normality effect in discrete causal judgment / confidence
+judgments <- judgments %>%
+    mutate(MC_resp=factor(MC_resp, levels=c('did not cause', 'partially caused', 'totally caused'),
+                          ordered=TRUE))
+mNorm_MC <- brm(bf(MC_resp ~ structure*normality + (1 |v| vignette), family=cumulative) +
+                bf(MC_conf ~ structure*normality + (1 |v| vignette),
+                   sigma ~ structure*normality + (1 |v| vignette)),
+                prior=c(set_prior('normal(0, 1.0)', resp='MCresp'),
+                        set_prior('normal(0, 1.0)', resp='MCconf'),
+                        set_prior('normal(0, 5.0)', resp='MCconf', dpar='sigma')),
+                data=judgments, file='mNorm_MC3', iter=5000, backend='cmdstanr',
+                control=list(adapt_delta=.95), inits="0",
+                sample_prior="yes", save_pars=save_pars(all=TRUE), cores=4)
+summary(mNorm_MC, prior=TRUE)
+
+## significance testing
+judgments %>%
+    data_grid(structure, normality) %>%
+    add_linpred_draws(mNorm_MC, re_formula=NA) %>%
+    compare_levels(.linpred, by='normality') %>%
+    pivot_wider(names_from=c(.category, structure), values_from=.linpred) %>%
+    select(starts_with('MCresp')) %>%
+    describe_posterior(ci=0.95, rope_ci=0.95, rope_range=c(-ROPE.MC_resp, ROPE.MC_resp)) %>%
+    bind_rows(judgments %>%
+              data_grid(structure, normality) %>%
+              add_linpred_draws(mNorm_MC, re_formula=NA) %>%
+              compare_levels(.linpred, by='normality') %>%
+              pivot_wider(names_from=c(.category, structure), values_from=.linpred) %>%
+              select(starts_with('MCconf')) %>%
+              describe_posterior(ci=0.95, rope_ci=0.95, rope_range=c(-ROPE.MC_conf, ROPE.MC_conf))) %>%
+    mutate(P=pd_to_p(pd))
+
+
+## plot model results
+draws_MC <- judgments %>%
+    data_grid(structure, normality) %>%
+    add_epred_draws(mNorm_MC, re_formula=NA) %>%
+    mutate(.category=factor(.category,
+                            levels=c('did not cause', 'partially caused', 'totally caused', 'MCconf'),
+                            labels=c('P(Did Not Cause)', 'P(Partially Caused)', 'P(Totally Caused)', 'Confidence')),
+           .resp=ifelse(.category=='Confidence', 'Confidence', 'Causal Judgment'))
+p.conf <- draws_MC %>%
+    filter(.category == 'Confidence') %>%
+    ggplot(aes(x=structure, y=.epred, fill=normality)) +
+    stat_halfeye(aes(side=ifelse(normality=='normal', 'left', 'right')),
+                 point_interval=median_hdi, position=position_dodge(.25)) +
+    theme_classic(base_size=18) + theme(axis.title.x=element_blank()) +
+    ylim(0, 1) + ylab('Posterior Mean Confidence') +
+    scale_x_discrete(name='Causal Structure', labels=c('Conjunctive', 'Disjunctive'),
+                     expand=expansion(0, 0)) +
+    scale_fill_manual(name='Normality', values=rev(wes_palette("Darjeeling1", n=2)),
+                      labels=c('Normal', 'Abnormal'))
+p.cause <- draws_MC %>%
+    filter(.category != 'Confidence', .category != 'P(Totally Caused)') %>%
+    pivot_wider(names_from=.category, values_from=.epred) %>%
+    mutate(`P(Partially Caused)`=`P(Did Not Cause)`+`P(Partially Caused)`) %>%
+    pivot_longer(`P(Did Not Cause)`:`P(Partially Caused)`, names_to='.category', values_to='.epred') %>%
+    ggplot(aes(x=normality, y=.epred)) +
+    stat_cdfinterval(aes(fill = stat(f)), thickness=1,
+                     n=1000, point_interval=NULL) +
+    stat_pointinterval(aes(group=.category)) +
+    scale_fill_gradient2(low=PALETTE[2], mid=PALETTE[1], high=PALETTE[3], midpoint=0.5,
+                         guide='legend', limits=c(0, 1), breaks=c(0, 0.5, 1),
+                         name='Discrete\nCausal\nJudgment',
+                         labels=c('Did Not Cause', 'Partially Caused', 'Totally Caused')) +
+    facet_wrap(~ structure, labeller=labeller(structure=c('JC'='Conjunctive', 'OD'='Disjunctive'))) +
+    scale_x_discrete(name='Normality', labels=c('Normal', 'Abnormal')) +
+    ylab('Cumulative Probability\nof Response') + ylim(0, 1) +
+    theme_classic(base_size=18)
+
+p.cause / p.conf
+ggsave('FigureS1-14.png', width=10, height=10, dpi=2000)
+
+
+
+
+### Run a mediation analysis
+
+## fit the null model (average total effect)
+m <- brm(bf(VAS_resp ~ structure*normality + (1 |i| id) + (1 |v| vignette),
+            sigma ~ structure*normality + (1 |i| id) + (1 |v| vignette)),
+         prior=c(set_prior('normal(0, 1.0)'),
+                 set_prior('normal(0, 5.0)', dpar='sigma')),
+         save_pars=save_pars(all=TRUE), data=judgments %>% mutate(MC_resp=factor(MC_resp, ordered=FALSE)),
+         cores=4, iter=5000, inits="0", file='mMed_null',
+         backend='cmdstanr', control=list(adapt_delta=.99))
+
+## fit the mediation models (average direct effect) for confidence in continuous/discrete judgment
+m_med_MC <- brm(bf(VAS_resp ~ structure*normality + MC_conf:MC_resp + (1 |i| id) + (1 |v| vignette),
+                   sigma ~ structure*normality + MC_conf:MC_resp + (1 |i| id) + (1 |v| vignette)),
+         prior=c(set_prior('normal(0, 1.0)'),
+                 set_prior('normal(0, 5.0)', dpar='sigma')),
+         save_pars=save_pars(all=TRUE), data=judgments %>% mutate(MC_resp=factor(MC_resp, ordered=FALSE)),
+         cores=4, iter=5000, inits="0", file='mMed_MC',
+         backend='cmdstanr', control=list(adapt_delta=.99))
+m_med_VAS <- brm(bf(VAS_resp ~ structure*normality + VAS_conf:MC_resp + (1 |i| id) + (1 |v| vignette),
+                    sigma ~ structure*normality + VAS_conf:MC_resp + (1 |i| id) + (1 |v| vignette)),
+         prior=c(set_prior('normal(0, 1.0)'),
+                 set_prior('normal(0, 5.0)', dpar='sigma')),
+         save_pars=save_pars(all=TRUE), data=judgments %>% mutate(MC_resp=factor(MC_resp, ordered=FALSE)),
+         cores=4, iter=5000, inits="0", file='mMed_VAS',
+         backend='cmdstanr', control=list(adapt_delta=.99))
+
+## calculate prop. mediated (note: use ROPE = [-.1, .1] for prop. mediated)
+m %>% emmeans(~normality|structure) %>% contrast(method='revpairwise') %>% gather_emmeans_draws(value='total') %>%
+    full_join(m_med_MC %>% emmeans(~normality|structure) %>% contrast(method='revpairwise') %>% gather_emmeans_draws(value='mediation')) %>%
+    mutate(prop_mediated=1-mediation/total) %>%
+    pivot_wider(names_from=structure, values_from=total:prop_mediated) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(ci=.95, rope_ci=.95, rope_range=c(-ROPE, ROPE)) %>%
+    mutate(P=pd_to_p(pd))
+m %>% emmeans(~normality|structure) %>% contrast(method='revpairwise') %>% gather_emmeans_draws(value='total') %>%
+    full_join(m_med_VAS %>% emmeans(~normality|structure) %>% contrast(method='revpairwise') %>% gather_emmeans_draws(value='mediation')) %>%
+    mutate(prop_mediated=1-mediation/total) %>%
+    pivot_wider(names_from=structure, values_from=total:prop_mediated) %>%
+    select(-.chain, -.iteration, -.draw) %>%
+    describe_posterior(ci=.95, rope_ci=.95, rope_range=c(-ROPE, ROPE)) %>%
+    mutate(P=pd_to_p(pd))
